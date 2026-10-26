@@ -309,6 +309,8 @@ func (p *Plan) appendEndpointUpdates(t planTable, changes *Changes, current *end
 	update := t.resolver.ResolveUpdate(current, candidates)
 
 	if p.needsUpdate(current, update) {
+		// ALERT(ep0ll): handle scenarioes where, if provider returns the TXT records that were not part of the desired records, then they will be deleted
+		// Migrating from TXT registry to oanother causes all TXT records to get deleted
 		inheritOwner(current, update)
 		changes.UpdateNew = append(changes.UpdateNew, update)
 		changes.UpdateOld = append(changes.UpdateOld, current)
@@ -336,15 +338,93 @@ func (p *Plan) needsUpdate(current, desired *endpoint.Endpoint) bool {
 		return true
 	}
 
-	if !isRegistryNoOp(p.Metadata) {
-		// NOTE(ep0ll): Resource label must move with the owning source so delete-event
-		// attribution (#6766) stays correct.
-		if current.Labels[endpoint.ResourceLabelKey] != desired.Labels[endpoint.ResourceLabelKey] {
-			return true
-		}
+	// NOTE(ep0ll): Resource label must move with the owning source so delete-event
+	// attribution (#6766) stays correct.
+	if awssdDescriptionChanged(current, desired) {
+		return true
+	}
+
+	// 1. for the "CRD" registry and source when used together: [endpoint.ResourceLabelKey] will always be found
+	// 2. for scenarios where "CRD" registry used with unknown provider, [endpoint.ResourceLabelKey] is only present if they define in desired state
+	// 3. if provider and the registry labels mismatch: [endpoint.ResourceLabelKey] is set when provider has one already created
+	// 4. so the only case we need to handle is:
+		// for scenarios where "CRD" registry used with unknown provider:
+			// if the provider has no record and registry creates one:
+				// [endpoint.ResourceLabelKey] is upto the DNSRecord/v1alpha
+			// 
+	if current.Labels[endpoint.ResourceLabelKey] != desired.Labels[endpoint.ResourceLabelKey] {
+		return true
+	}
+
+	// NOTE(ep0ll): empty resource label most likely represent the Noop Registry
+	//
+	//
+	//
+	// for CRD registry: the records are retrived from k8s client as a CustomResourceDefinition and nothing from the provider
+	// for writes: both the CustomResourceDefinition and the provider gets wrote
+	// it is upto the provider how they manage the labels of the endpoints
+	//
+	//
+	//
+	// for TXT, it retrives ownership from the TXT record
+	// for sincarios where we now migrated to TXT registry, the ownership doesn't move. 
+	// for example from aws-sd: we should look into provider specific label
+	// the label "aws-sd-description" has resource ownership, so it doesn't populated at [endpoint.ResourceLabelKey]
+	// but instead stays at "aws-sd-description"
+	//
+	//
+	//
+	// for dynamodb registry, the TXT record is used as a fallback to migrate from. sets provider specific label "dynamodb/needs-migration" to true
+	// the records retrived are used as is. if the provider doesn't set the [endpoint.ResourceLabelKey], then it is empty
+	// only by default the provider populated labels are returned
+	// 
+	//
+	//
+	// the aws-sd provider reads labels from and writes labels to [endpoint.AWSSDDescriptionLabel] key
+	// the aws-sd registry sets all current labels in label's key [endpoint.AWSSDDescriptionLabel] after setting owner
+	// the aws-sd registry retrived records use endpoint.NewLabelsFromStringPlain(record.Labels[endpoint.AWSSDDescriptionLabel])
+	// whch populates label [endpoint.ResourceLabelKey]
+	// which means if migrted from another registry: record.Labels[endpoint.AWSSDDescriptionLabel] can be empty
+	//
+	//
+	//
+	// for noop, the provider generated labels are populated.
+	// the provider is responsibe for storing/managing the current labels 
+	// if retived provider doesn't set the [endpoint.ResourceLabelKey] then is empty
+	// if retrived provider sets record.Labels[endpoint.AWSSDDescriptionLabel] or "aws-sd-description" then those labels have the ownership to move
+	if current.Labels[endpoint.ResourceLabelKey] != "" {
+		// 1. for the "connector" source, the [endpoint.ResourceLabelKey] is unkown
+		// 2. "empty" source returns no endpoint at all, so no [endpoint.ResourceLabelKey]
+		// 3. "gloo-proxy" source doesn't seems to set [endpoint.ResourceLabelKey], unsure about it
+		// 4. "pod" source doesn't seems to set [endpoint.ResourceLabelKey], unsure about it
+		// 5. for ```webhook provider```, the [endpoint.ResourceLabelKey] label is defined if the webhook provider manages it
+		// 6. every other ExternalDNS Sources provide the [endpoint.ResourceLabelKey] except the list mentioned above, at the time of writing!
 	}
 
 	return false
+}
+
+// awssdDescriptionChanged reports whether both endpoints have an AWS SD
+// description and its value differs. A missing label on either endpoint is not
+// treated as a change.
+func awssdDescriptionChanged(current, desired *endpoint.Endpoint) bool {
+	// NOTE(ep0ll): if current record has no current.Labels[endpoint.AWSSDDescriptionLabel]
+	// then simply assume the endpoint is not managed by any instance of External DNS
+	//
+	// for senarios: where provider doesn't set [endpoint.AWSSDDescriptionLabel], Labels will be empty
+	
+	// if previously the user has used TXT registry, then the TXT records are populated in addition when retriving records
+	// the desired state has no TXT ownership records, which will infer to delete them from the provider
+	
+	// for migrating from other registries like crd, the [endpoint.AWSSDDescriptionLabel] present only if they specify in resource DNSRecord/v1alpha
+	// if they provided [endpoint.ResourceLabelKey] or any other label instead: then current.Labels[endpoint.AWSSDDescriptionLabel] might be unset
+	// in such scenarios the current.Labels[endpoint.AWSSDDescriptionLabel] will be empty and when called endpoint.NewLabelsFromStringPlain(...), will return unset [endpoint.ResourceLabelKey] label
+	// so now we have 2 sources of truth: the provider indeed has [endpoint.ResourceLabelKey] but AWSSD registry unable it recognise it
+	// when desired.Labels[endpoint.AWSSDDescriptionLabel] got changed
+    currentDesc, currentOK := current.Labels[endpoint.AWSSDDescriptionLabel]
+    desiredDesc, desiredOK := desired.Labels[endpoint.ResourceLabelKey]
+
+    return currentOK && desiredOK && currentDesc != desiredDesc
 }
 
 func (p *Plan) isOldOwnerIDSetAndDifferent(current *endpoint.Endpoint) bool {
