@@ -131,27 +131,10 @@ func (sdr *AWSSDRegistry) filterUpdates(newEps, oldEps []*endpoint.Endpoint) ([]
 // updateNeeded reports whether desired differs from current in a way that
 // requires pushing an update to AWS SD.
 func updateNeeded(current, desired *endpoint.Endpoint) bool {
-	return resourceLabelChanged(
-		current.Labels.SerializePlain(false),
-		desired.Labels.SerializePlain(false),
-	) ||
+	return current.Labels[endpoint.ResourceLabelKey] !=
+		desired.Labels[endpoint.ResourceLabelKey] ||
 		current.RecordTTL != desired.RecordTTL ||
 		!current.Targets.Same(desired.Targets)
-}
-
-func resourceLabelChanged(current, desired string) bool {
-	currentLabels, currentErr := endpoint.NewLabelsFromStringPlain(current)
-	desiredLabels, desiredErr := endpoint.NewLabelsFromStringPlain(desired)
-
-	if desiredErr != nil {
-		return false
-	}
-	if currentErr != nil {
-		return true
-	}
-
-	return currentLabels[endpoint.ResourceLabelKey] !=
-		desiredLabels[endpoint.ResourceLabelKey]
 }
 
 func (sdr *AWSSDRegistry) updateLabels(endpoints []*endpoint.Endpoint) {
