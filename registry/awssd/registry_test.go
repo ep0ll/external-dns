@@ -168,3 +168,139 @@ func newEndpointWithOwnerAndDescription(dnsName, target, recordType, ownerID str
 	e.Labels[endpoint.AWSSDDescriptionLabel] = description
 	return e
 }
+
+
+func TestAWSSDRegistry_ApplyChanges_FiltersUpdates(t *testing.T) {
+	tests := []struct {
+		name           string
+		currentOwner   string
+		desiredOwner   string
+		currentTarget  string
+		desiredTarget  string
+		currentResource string
+		desiredResource string
+		wantUpdates    int
+	}{
+		{
+			name:            "resource label changes",
+			currentOwner:    "owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "service/default/app",
+			desiredResource: "ingress/default/app",
+			wantUpdates:     1,
+		},
+		{
+			name:            "resource label unchanged",
+			currentOwner:    "owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "service/default/app",
+			desiredResource: "service/default/app",
+			wantUpdates:     0,
+		},
+		{
+			name:            "target changes",
+			currentOwner:    "owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "5.6.7.8",
+			currentResource: "service/default/app",
+			desiredResource: "service/default/app",
+			wantUpdates:     1,
+		},
+		{
+			name:            "resource label added",
+			currentOwner:    "owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "",
+			desiredResource: "service/default/app",
+			wantUpdates:     1,
+		},
+		{
+			name:            "resource label removed",
+			currentOwner:    "owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "service/default/app",
+			desiredResource: "",
+			wantUpdates:     1,
+		},
+		{
+			name:            "desired endpoint belongs to another owner",
+			currentOwner:    "owner",
+			desiredOwner:    "another-owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "service/default/app",
+			desiredResource: "ingress/default/app",
+			wantUpdates:     0,
+		},
+		{
+			name:            "current endpoint belongs to another owner",
+			currentOwner:    "another-owner",
+			desiredOwner:    "owner",
+			currentTarget:   "1.2.3.4",
+			desiredTarget:   "1.2.3.4",
+			currentResource: "service/default/app",
+			desiredResource: "ingress/default/app",
+			wantUpdates:     0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := endpoint.NewEndpoint(
+				"app.example.org",
+				endpoint.RecordTypeA,
+				tt.currentTarget,
+			).WithLabel(endpoint.OwnerLabelKey, tt.currentOwner)
+
+			desired := endpoint.NewEndpoint(
+				"app.example.org",
+				endpoint.RecordTypeA,
+				tt.desiredTarget,
+			).WithLabel(endpoint.OwnerLabelKey, tt.desiredOwner)
+
+			if tt.currentResource != "" {
+				current = current.WithLabel(
+					endpoint.ResourceLabelKey,
+					tt.currentResource,
+				)
+			}
+			if tt.desiredResource != "" {
+				desired = desired.WithLabel(
+					endpoint.ResourceLabelKey,
+					tt.desiredResource,
+				)
+			}
+
+			var got *plan.Changes
+			p := newInMemoryProvider(nil, func(changes *plan.Changes) {
+				got = changes
+			})
+
+			r, err := newRegistry(p, "owner")
+			require.NoError(t, err)
+
+			err = r.ApplyChanges(t.Context(), &plan.Changes{
+				UpdateNew: []*endpoint.Endpoint{desired},
+				UpdateOld: []*endpoint.Endpoint{current},
+			})
+			require.NoError(t, err)
+			require.NotNil(t, got)
+
+			assert.Len(t, got.UpdateNew, tt.wantUpdates)
+			assert.Len(t, got.UpdateOld, tt.wantUpdates)
+
+			if tt.wantUpdates == 1 {
+				assert.Equal(t, got.UpdateNew[0].Key(), got.UpdateOld[0].Key())
+			}
+		})
+	}
+}
