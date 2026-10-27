@@ -78,13 +78,17 @@ func (sdr *AWSSDRegistry) Records(ctx context.Context) ([]*endpoint.Endpoint, er
 	return records, nil
 }
 
-// ApplyChanges filters out records not owned the External-DNS, additionally it adds the required label
-// inserted in the AWS SD instance as a CreateID field
+// ApplyChanges filters out records not owned by External-DNS, additionally it adds the required label
+// inserted in the AWS SD instance as a CreateID field.
+// Updates are only forwarded when the resource label actually changed between the
+// current (old) and desired (new) endpoint.
 func (sdr *AWSSDRegistry) ApplyChanges(ctx context.Context, changes *plan.Changes) error {
+	updateNew, updateOld := sdr.filterUpdates(changes.UpdateNew, changes.UpdateOld)
+
 	filteredChanges := &plan.Changes{
 		Create:    changes.Create,
-		UpdateNew: endpoint.FilterEndpointsByOwnerID(sdr.ownerID, changes.UpdateNew),
-		UpdateOld: endpoint.FilterEndpointsByOwnerID(sdr.ownerID, changes.UpdateOld),
+		UpdateNew: updateNew,
+		UpdateOld: updateOld,
 		Delete:    endpoint.FilterEndpointsByOwnerID(sdr.ownerID, changes.Delete),
 	}
 
@@ -94,6 +98,60 @@ func (sdr *AWSSDRegistry) ApplyChanges(ctx context.Context, changes *plan.Change
 	sdr.updateLabels(filteredChanges.Delete)
 
 	return sdr.provider.ApplyChanges(ctx, filteredChanges)
+}
+
+// filterUpdates keeps only the (new, old) pairs that are owned by this registry
+// and whose resource label differs between current and desired state.
+// The returned slices stay index-aligned.
+func (sdr *AWSSDRegistry) filterUpdates(newEps, oldEps []*endpoint.Endpoint) ([]*endpoint.Endpoint, []*endpoint.Endpoint) {
+	ownedNew := endpoint.FilterEndpointsByOwnerID(sdr.ownerID, newEps)
+	ownedOld := endpoint.FilterEndpointsByOwnerID(sdr.ownerID, oldEps)
+
+	oldByKey := make(map[endpoint.EndpointKey]*endpoint.Endpoint, len(ownedOld))
+	for _, ep := range ownedOld {
+		oldByKey[ep.Key()] = ep
+	}
+
+	filteredNew := make([]*endpoint.Endpoint, 0, len(ownedNew))
+	filteredOld := make([]*endpoint.Endpoint, 0, len(ownedNew))
+
+	for _, desired := range ownedNew {
+		current, ok := oldByKey[desired.Key()]
+		if !ok || !updateNeeded(current, desired) {
+			continue
+		}
+
+		filteredNew = append(filteredNew, desired)
+		filteredOld = append(filteredOld, current)
+	}
+
+	return filteredNew, filteredOld
+}
+
+// updateNeeded reports whether desired differs from current in a way that
+// requires pushing an update to AWS SD.
+func updateNeeded(current, desired *endpoint.Endpoint) bool {
+	return resourceLabelChanged(
+		current.Labels.SerializePlain(false),
+		desired.Labels.SerializePlain(false),
+	) ||
+		current.RecordTTL != desired.RecordTTL ||
+		!current.Targets.Same(desired.Targets)
+}
+
+func resourceLabelChanged(current, desired string) bool {
+	currentLabels, currentErr := endpoint.NewLabelsFromStringPlain(current)
+	desiredLabels, desiredErr := endpoint.NewLabelsFromStringPlain(desired)
+
+	if desiredErr != nil {
+		return false
+	}
+	if currentErr != nil {
+		return true
+	}
+
+	return currentLabels[endpoint.ResourceLabelKey] !=
+		desiredLabels[endpoint.ResourceLabelKey]
 }
 
 func (sdr *AWSSDRegistry) updateLabels(endpoints []*endpoint.Endpoint) {
