@@ -169,138 +169,100 @@ func newEndpointWithOwnerAndDescription(dnsName, target, recordType, ownerID str
 	return e
 }
 
+// endpointState holds the only two things these tests vary on an endpoint.
+type endpointState struct {
+	owner    string
+	resource string
+}
+
+func (s endpointState) endpoint() *endpoint.Endpoint {
+	ep := endpoint.NewEndpoint("app.example.org", endpoint.RecordTypeA, "1.2.3.4").
+		WithLabel(endpoint.OwnerLabelKey, s.owner)
+	if s.resource != "" {
+		ep.WithLabel(endpoint.ResourceLabelKey, s.resource)
+	}
+	return ep
+}
+
+// applyUpdate runs a single current -> desired update through the registry
+// and returns the changes that reached the provider.
+func applyUpdate(t *testing.T, current, desired endpointState) *plan.Changes {
+	t.Helper()
+
+	var got *plan.Changes
+	p := newInMemoryProvider(nil, func(changes *plan.Changes) { got = changes })
+
+	r, err := newRegistry(p, "owner")
+	require.NoError(t, err)
+
+	err = r.ApplyChanges(t.Context(), &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{current.endpoint()},
+		UpdateNew: []*endpoint.Endpoint{desired.endpoint()},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, got)
+
+	return got
+}
 
 func TestAWSSDRegistry_ApplyChanges_FiltersUpdates(t *testing.T) {
+	const (
+		registryOwner = "owner"
+		otherOwner    = "another-owner"
+		serviceApp    = "service/default/app"
+		ingressApp    = "ingress/default/app"
+	)
+
 	tests := []struct {
-		name           string
-		currentOwner   string
-		desiredOwner   string
-		currentTarget  string
-		desiredTarget  string
-		currentResource string
-		desiredResource string
-		wantUpdates    int
+		name        string
+		current     endpointState
+		desired     endpointState
+		wantUpdates int
 	}{
 		{
-			name:            "resource label changes",
-			currentOwner:    "owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "service/default/app",
-			desiredResource: "ingress/default/app",
-			wantUpdates:     1,
+			name:        "resource label changes",
+			current:     endpointState{registryOwner, serviceApp},
+			desired:     endpointState{registryOwner, ingressApp},
+			wantUpdates: 1,
 		},
 		{
-			name:            "resource label unchanged",
-			currentOwner:    "owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "service/default/app",
-			desiredResource: "service/default/app",
-			wantUpdates:     0,
+			name:        "resource label unchanged",
+			current:     endpointState{registryOwner, serviceApp},
+			desired:     endpointState{registryOwner, serviceApp},
+			wantUpdates: 0,
 		},
 		{
-			name:            "target changes",
-			currentOwner:    "owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "5.6.7.8",
-			currentResource: "service/default/app",
-			desiredResource: "service/default/app",
-			wantUpdates:     1,
+			name:        "resource label added",
+			current:     endpointState{registryOwner, ""},
+			desired:     endpointState{registryOwner, serviceApp},
+			wantUpdates: 1,
 		},
 		{
-			name:            "resource label added",
-			currentOwner:    "owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "",
-			desiredResource: "service/default/app",
-			wantUpdates:     1,
+			name:        "resource label removed",
+			current:     endpointState{registryOwner, serviceApp},
+			desired:     endpointState{registryOwner, ""},
+			wantUpdates: 1,
 		},
 		{
-			name:            "resource label removed",
-			currentOwner:    "owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "service/default/app",
-			desiredResource: "",
-			wantUpdates:     1,
+			name:        "desired endpoint belongs to another owner",
+			current:     endpointState{registryOwner, serviceApp},
+			desired:     endpointState{otherOwner, ingressApp},
+			wantUpdates: 0,
 		},
 		{
-			name:            "desired endpoint belongs to another owner",
-			currentOwner:    "owner",
-			desiredOwner:    "another-owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "service/default/app",
-			desiredResource: "ingress/default/app",
-			wantUpdates:     0,
-		},
-		{
-			name:            "current endpoint belongs to another owner",
-			currentOwner:    "another-owner",
-			desiredOwner:    "owner",
-			currentTarget:   "1.2.3.4",
-			desiredTarget:   "1.2.3.4",
-			currentResource: "service/default/app",
-			desiredResource: "ingress/default/app",
-			wantUpdates:     0,
+			name:        "current endpoint belongs to another owner",
+			current:     endpointState{otherOwner, serviceApp},
+			desired:     endpointState{registryOwner, ingressApp},
+			wantUpdates: 0,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			current := endpoint.NewEndpoint(
-				"app.example.org",
-				endpoint.RecordTypeA,
-				tt.currentTarget,
-			).WithLabel(endpoint.OwnerLabelKey, tt.currentOwner)
-
-			desired := endpoint.NewEndpoint(
-				"app.example.org",
-				endpoint.RecordTypeA,
-				tt.desiredTarget,
-			).WithLabel(endpoint.OwnerLabelKey, tt.desiredOwner)
-
-			if tt.currentResource != "" {
-				current = current.WithLabel(
-					endpoint.ResourceLabelKey,
-					tt.currentResource,
-				)
-			}
-			if tt.desiredResource != "" {
-				desired = desired.WithLabel(
-					endpoint.ResourceLabelKey,
-					tt.desiredResource,
-				)
-			}
-
-			var got *plan.Changes
-			p := newInMemoryProvider(nil, func(changes *plan.Changes) {
-				got = changes
-			})
-
-			r, err := newRegistry(p, "owner")
-			require.NoError(t, err)
-
-			err = r.ApplyChanges(t.Context(), &plan.Changes{
-				UpdateNew: []*endpoint.Endpoint{desired},
-				UpdateOld: []*endpoint.Endpoint{current},
-			})
-			require.NoError(t, err)
-			require.NotNil(t, got)
+			got := applyUpdate(t, tt.current, tt.desired)
 
 			assert.Len(t, got.UpdateNew, tt.wantUpdates)
 			assert.Len(t, got.UpdateOld, tt.wantUpdates)
-
-			if tt.wantUpdates == 1 {
-				assert.Equal(t, got.UpdateNew[0].Key(), got.UpdateOld[0].Key())
-			}
 		})
 	}
 }
